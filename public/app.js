@@ -44,6 +44,7 @@ const AVATAR_COLORS = [
 const state = {
   ws: null,
   selfId: null,
+  token: null,          // 断线恢复身份用的会话令牌
   name: '',
   roomCode: null,
   members: new Map(),        // id -> { id, name }
@@ -157,18 +158,21 @@ function sendMsg(msg) {
 
 function handleDisconnect() {
   const wasInRoom = !!state.roomCode && !state.intentionalLeave;
-  stopLocalShare(false);
-  closeAllPeers();
-  clearRemoteStage();
 
   if (!wasInRoom) {
+    stopLocalShare(false);
+    closeAllPeers();
+    clearRemoteStage();
     state.roomCode = null;
     showView('home');
     setBusy(false);
     return;
   }
 
-  if (state.reconnectAttempts >= 5) {
+  if (state.reconnectAttempts >= 8) {
+    stopLocalShare(false);
+    closeAllPeers();
+    clearRemoteStage();
     toast('连接已断开，请刷新页面重试', 'error', 6000);
     state.roomCode = null;
     showView('home');
@@ -176,11 +180,19 @@ function handleDisconnect() {
     return;
   }
 
+  // 断的只是信令；画面走的是独立的媒体连接，保持不动。
+  // 重连后凭 token 恢复原身份（resume），不会在房间里产生"分身"
   const delay = Math.min(1000 * 2 ** state.reconnectAttempts, 8000);
   state.reconnectAttempts++;
   toast('连接断开，正在重连…', 'warn');
   setTimeout(() => {
-    connect(() => sendMsg({ type: 'join-room', roomCode: state.roomCode, name: state.name }));
+    connect(() => sendMsg({
+      type: 'resume',
+      roomCode: state.roomCode,
+      memberId: state.selfId,
+      token: state.token,
+      name: state.name,
+    }));
   }, delay);
 }
 
@@ -188,30 +200,50 @@ function handleSignal(msg) {
   switch (msg.type) {
     case 'joined': {
       state.reconnectAttempts = 0;
+      // 断线重连且身份恢复成功：媒体连接原封不动，只同步房间状态
+      const sameIdentity = msg.selfId === state.selfId && msg.roomCode === state.roomCode;
       state.roomCode = msg.roomCode;
       state.selfId = msg.selfId;
+      state.token = msg.token;
       state.presenterId = msg.presenterId;
       state.members = new Map(msg.members.map((m) => [m.id, m]));
+      // 清理离线期间已离开成员的旧媒体连接
+      for (const id of [...state.peers.keys()]) {
+        if (!state.members.has(id)) closePeer(id);
+      }
       history.replaceState(null, '', `?room=${msg.roomCode}`);
       showView('room');
       setBusy(false);
       renderRoom();
-      toast(`已进入房间 ${msg.roomCode}`, 'success');
-      // 进房时已有人在共享 → 显示等待画面状态
-      if (state.presenterId && state.presenterId !== state.selfId) {
-        setStageConnecting();
+      if (sameIdentity) {
+        toast('连接已恢复', 'success');
+        // 离线期间进来的新观众：补推流
+        if (state.presenterId === state.selfId && state.localStream) {
+          for (const id of state.members.keys()) {
+            if (id !== state.selfId && !state.peers.has(id)) offerTo(id);
+          }
+        }
+      } else {
+        toast(`已进入房间 ${msg.roomCode}`, 'success');
+        // 全新身份：旧媒体连接作废
+        closeAllPeers();
+        if (state.localStream) {
+          // 屏幕仍在采集（重连时未中断）：重新申请共享权，复用现有画面
+          sendMsg({ type: 'request-share' });
+        } else if (state.presenterId && state.presenterId !== state.selfId) {
+          setStageConnecting();
+        }
       }
       break;
     }
 
     case 'error': {
       setBusy(false);
-      if (msg.code === 'room-not-found') {
-        toast('房间不存在或已关闭', 'error');
-        state.roomCode = null;
-        showView('home');
-      } else if (msg.code === 'room-full') {
-        toast('房间已满（最多 3 人）', 'error');
+      if (msg.code === 'room-not-found' || msg.code === 'room-full') {
+        toast(msg.code === 'room-not-found' ? '房间不存在或已关闭' : '房间已满（最多 3 人）', 'error');
+        stopLocalShare(false);
+        closeAllPeers();
+        clearRemoteStage();
         state.roomCode = null;
         showView('home');
       }
@@ -241,8 +273,11 @@ function handleSignal(msg) {
     case 'presenter-changed': {
       state.presenterId = msg.presenterId;
       if (msg.presenterId === null) {
-        // 共享结束：观看端清理连接与画面
-        if (!state.localStream) {
+        if (state.localStream) {
+          // 我还在采集屏幕但锁被释放了（重连后旧身份被清理）：自动拿回共享权
+          sendMsg({ type: 'request-share' });
+        } else {
+          // 共享结束：观看端清理连接与画面
           closeAllPeers();
           clearRemoteStage();
         }
@@ -257,7 +292,20 @@ function handleSignal(msg) {
     }
 
     case 'share-granted': {
-      startCapture();
+      if (state.localStream) {
+        // 重连后复用仍在采集的画面，直接向所有人重新推流
+        state.presenterId = state.selfId;
+        el.stageVideo.srcObject = state.localStream;
+        el.stageVideo.muted = true;
+        el.stageVideo.play().catch(() => {});
+        setStageMode('local');
+        renderRoom();
+        for (const id of state.members.keys()) {
+          if (id !== state.selfId) offerTo(id);
+        }
+      } else {
+        startCapture();
+      }
       break;
     }
 

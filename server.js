@@ -119,6 +119,24 @@ function memberList(room) {
   return [...room.members.values()].map((m) => ({ id: m.id, name: m.name }));
 }
 
+// 以新成员身份把连接加入房间；token 用于断线后恢复身份
+function addMember(ws, room, name) {
+  const member = { id: genId(), name, ws, token: genId() + genId() };
+  room.members.set(member.id, member);
+  return member;
+}
+
+function sendJoined(ws, room, member) {
+  send(ws, {
+    type: 'joined',
+    roomCode: room.code,
+    selfId: member.id,
+    token: member.token,
+    members: memberList(room),
+    presenterId: room.presenterId,
+  });
+}
+
 wss.on('connection', (ws) => {
   ws.isAlive = true;
   ws.on('pong', () => { ws.isAlive = true; });
@@ -135,15 +153,9 @@ wss.on('connection', (ws) => {
         if (self) return;
         const room = { code: genRoomCode(), members: new Map(), presenterId: null };
         rooms.set(room.code, room);
-        self = { id: genId(), name: cleanName(msg.name), room };
-        room.members.set(self.id, { id: self.id, name: self.name, ws });
-        send(ws, {
-          type: 'joined',
-          roomCode: room.code,
-          selfId: self.id,
-          members: memberList(room),
-          presenterId: null,
-        });
+        const member = addMember(ws, room, cleanName(msg.name));
+        self = { id: member.id, name: member.name, room };
+        sendJoined(ws, room, member);
         break;
       }
 
@@ -153,15 +165,34 @@ wss.on('connection', (ws) => {
         const room = rooms.get(code);
         if (!room) return send(ws, { type: 'error', code: 'room-not-found' });
         if (room.members.size >= MAX_MEMBERS) return send(ws, { type: 'error', code: 'room-full' });
-        self = { id: genId(), name: cleanName(msg.name), room };
-        room.members.set(self.id, { id: self.id, name: self.name, ws });
-        send(ws, {
-          type: 'joined',
-          roomCode: code,
-          selfId: self.id,
-          members: memberList(room),
-          presenterId: room.presenterId,
-        });
+        const member = addMember(ws, room, cleanName(msg.name));
+        self = { id: member.id, name: member.name, room };
+        sendJoined(ws, room, member);
+        broadcast(room, { type: 'peer-joined', member: { id: self.id, name: self.name } }, self.id);
+        break;
+      }
+
+      case 'resume': {
+        // 断线重连：凭 token 接管原身份，媒体连接与共享状态不受影响
+        if (self) return;
+        const code = String(msg.roomCode || '').trim().toUpperCase();
+        const room = rooms.get(code);
+        if (!room) return send(ws, { type: 'error', code: 'room-not-found' });
+        const m = room.members.get(msg.memberId);
+        if (m && msg.token && m.token === msg.token) {
+          if (m.ws !== ws) {
+            try { m.ws.terminate(); } catch { /* 旧连接可能已死 */ }
+          }
+          m.ws = ws;
+          self = { id: m.id, name: m.name, room };
+          sendJoined(ws, room, m);
+          return;
+        }
+        // 原身份已被清理：按普通加入处理
+        if (room.members.size >= MAX_MEMBERS) return send(ws, { type: 'error', code: 'room-full' });
+        const member = addMember(ws, room, cleanName(msg.name));
+        self = { id: member.id, name: member.name, room };
+        sendJoined(ws, room, member);
         broadcast(room, { type: 'peer-joined', member: { id: self.id, name: self.name } }, self.id);
         break;
       }
@@ -202,6 +233,9 @@ wss.on('connection', (ws) => {
   ws.on('close', () => {
     if (!self) return;
     const room = self.room;
+    const cur = room.members.get(self.id);
+    // 身份已被新连接接管（resume）：旧连接关闭不得移除成员
+    if (!cur || cur.ws !== ws) return;
     room.members.delete(self.id);
     if (room.presenterId === self.id) {
       room.presenterId = null;

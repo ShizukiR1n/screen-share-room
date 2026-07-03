@@ -24,13 +24,19 @@ function client() {
     ws,
     send: (m) => ws.send(JSON.stringify(m)),
     open: () => new Promise((r) => ws.once('open', r)),
-    // 等待某类型消息（先查积压队列）
+    // 等待某类型消息（先查积压队列；超时后清理等待器，避免吞掉后续消息）
     wait: (type, ms = 3000) => {
       const i = queue.findIndex((m) => m.type === type);
       if (i >= 0) return Promise.resolve(queue.splice(i, 1)[0]);
       return new Promise((resolve, reject) => {
-        const t = setTimeout(() => reject(new Error(`等待 ${type} 超时`)), ms);
-        waiters.push({ type, resolve: (m) => { clearTimeout(t); resolve(m); } });
+        const w = { type, resolve: null };
+        const t = setTimeout(() => {
+          const idx = waiters.indexOf(w);
+          if (idx >= 0) waiters.splice(idx, 1);
+          reject(new Error(`等待 ${type} 超时`));
+        }, ms);
+        w.resolve = (m) => { clearTimeout(t); resolve(m); };
+        waiters.push(w);
       });
     },
     close: () => ws.close(),
@@ -63,7 +69,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
   const c = client(); await c.open();
   c.send({ type: 'join-room', roomCode: code, name: '丙' });
-  await c.wait('joined');
+  const joinedC = await c.wait('joined');
   await a.wait('peer-joined'); await b.wait('peer-joined');
 
   const d = client(); await d.open();
@@ -104,8 +110,30 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   assert((await a.wait('peer-left')).id === joinedB.selfId, '广播 peer-left');
   await c.wait('presenter-changed'); await c.wait('peer-left');
 
+  console.log('— 断线恢复身份（resume） —');
+  // c 模拟信令闪断后凭 token 恢复
+  const c2 = client(); await c2.open();
+  c2.send({ type: 'resume', roomCode: code, memberId: joinedC.selfId, token: joinedC.token, name: '丙' });
+  const resumedC = await c2.wait('joined');
+  assert(resumedC.selfId === joinedC.selfId, 'resume 后身份不变（同一 selfId）');
+  assert(resumedC.members.length === 2, '成员数不变（没有分身）');
+  let ghostEvent = false;
+  try { await a.wait('peer-joined', 800); ghostEvent = true; } catch { /* 预期超时 */ }
+  assert(!ghostEvent, 'A 不会收到多余的 peer-joined（无分身广播）');
+
+  // 错误 token：回退为普通加入（新身份 + 广播）
+  const d2 = client(); await d2.open();
+  d2.send({ type: 'resume', roomCode: code, memberId: joinedC.selfId, token: 'wrong-token', name: '丙分身' });
+  const fallback = await d2.wait('joined');
+  assert(fallback.selfId !== joinedC.selfId, '错误 token 回退为新身份');
+  assert((await a.wait('peer-joined')).member.name === '丙分身', '回退路径正常广播 peer-joined');
+  d2.close();
+  await a.wait('peer-left');
+  c2.close();
+  await a.wait('peer-left');
+
   console.log('— 房间销毁 —');
-  a.close(); c.close();
+  a.close();
   await sleep(200);
   const y = client(); await y.open();
   y.send({ type: 'join-room', roomCode: code, name: '再来' });
