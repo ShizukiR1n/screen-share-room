@@ -1,0 +1,14 @@
+{
+  "name": "screen-share-room",
+  "version": "1.0.0",
+  "private": true,
+  "description": "聚幕 — 三人屏幕共享直播间（WebRTC + WebSocket 信令）",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "ws": "^8.18.0"
+  }
+}
