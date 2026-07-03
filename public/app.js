@@ -130,11 +130,20 @@ function wsUrl() {
   return proto + location.host;
 }
 
+let clientPingTimer = null;
+
 function connect(onOpen) {
   const ws = new WebSocket(wsUrl());
   state.ws = ws;
 
-  ws.onopen = () => onOpen && onOpen();
+  ws.onopen = () => {
+    // 应用层心跳：托管平台的代理可能按"客户端方向长时间无数据"掐断长连接
+    clearInterval(clientPingTimer);
+    clientPingTimer = setInterval(() => {
+      if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'ping' }));
+    }, 25000);
+    if (onOpen) onOpen();
+  };
 
   ws.onmessage = (ev) => {
     let msg;
@@ -144,6 +153,7 @@ function connect(onOpen) {
 
   ws.onclose = () => {
     if (state.ws !== ws) return; // 已被新连接替换
+    clearInterval(clientPingTimer);
     handleDisconnect();
   };
 

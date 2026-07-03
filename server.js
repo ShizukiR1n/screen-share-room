@@ -197,6 +197,12 @@ wss.on('connection', (ws) => {
         break;
       }
 
+      case 'ping': {
+        // 应用层心跳：保持客户端→服务器方向有数据，防代理按"入向空闲"掐连接
+        send(ws, { type: 'pong' });
+        break;
+      }
+
       case 'request-share': {
         if (!self) return;
         const room = self.room;
