@@ -32,11 +32,10 @@ app.get('/api/ice', async (req, res) => {
     const username = String(Math.floor(Date.now() / 1000) + 12 * 3600);
     const credential = crypto.createHmac('sha1', TURN_SECRET).update(username).digest('base64');
     return res.json({
+      // 只提供 UDP 中继：TURN-over-TCP 会让 WebRTC 拥塞控制误判并把码率压到接近 0
+      // （TCP 缓冲膨胀→死亡螺旋），实时视频绝不能走 TCP 中继
       iceServers: [{
-        urls: [
-          `turn:${TURN_HOST}:${TURN_PORT}?transport=udp`,
-          `turn:${TURN_HOST}:${TURN_PORT}?transport=tcp`,
-        ],
+        urls: [`turn:${TURN_HOST}:${TURN_PORT}?transport=udp`],
         username,
         credential,
       }],
