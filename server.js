@@ -18,7 +18,10 @@ app.use(express.static(path.join(__dirname, 'public')));
 // 3. Cloudflare 临时凭据：CF_TURN_KEY_ID + CF_TURN_API_TOKEN
 const TURN_HOST = process.env.TURN_HOST;
 const TURN_SECRET = process.env.TURN_SECRET;
-const TURN_PORT = process.env.TURN_PORT || 3478;
+// 对外公布的中继端口默认 443（QUIC 端口）：很多校园/公司网对"杂牌端口"的 UDP 限速，
+// 但绝不敢限 443/udp（会拖垮 Chrome 的 QUIC）。服务器用 iptables 把 443/udp 转发到
+// coturn 实际监听的 3478（见 deploy/coturn-setup.sh）
+const TURN_PORT = process.env.TURN_PORT || 443;
 const TURN_URLS = process.env.TURN_URLS;
 const TURN_USERNAME = process.env.TURN_USERNAME;
 const TURN_CREDENTIAL = process.env.TURN_CREDENTIAL;
