@@ -34,14 +34,18 @@ app.get('/api/ice', async (req, res) => {
     // coturn use-auth-secret：用户名为过期时间戳，凭据为 HMAC-SHA1 签名
     const username = String(Math.floor(Date.now() / 1000) + 12 * 3600);
     const credential = crypto.createHmac('sha1', TURN_SECRET).update(username).digest('base64');
+    // 只提供 UDP 中继（TCP 中继会导致拥塞控制死亡螺旋，绝不使用）。
+    // 同时公布两个 UDP 端口，排前的优先：
+    //   443  —— QUIC 端口，绕开校园/公司网对杂牌端口 UDP 的限速
+    //   3478 —— 标准端口，兜底个别网络反而封 443/udp 的情况（如部分家用路由）
+    // 每个客户端各自用能通的端口分配中继，互不影响
+    const ports = [...new Set([Number(TURN_PORT), 3478])];
     return res.json({
-      // 只提供 UDP 中继：TURN-over-TCP 会让 WebRTC 拥塞控制误判并把码率压到接近 0
-      // （TCP 缓冲膨胀→死亡螺旋），实时视频绝不能走 TCP 中继
-      iceServers: [{
-        urls: [`turn:${TURN_HOST}:${TURN_PORT}?transport=udp`],
+      iceServers: ports.map((p) => ({
+        urls: [`turn:${TURN_HOST}:${p}?transport=udp`],
         username,
         credential,
-      }],
+      })),
     });
   }
   if (TURN_URLS && TURN_USERNAME && TURN_CREDENTIAL) {
