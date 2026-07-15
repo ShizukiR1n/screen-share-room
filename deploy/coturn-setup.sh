@@ -52,12 +52,7 @@ systemctl enable coturn >/dev/null 2>&1 || true
 systemctl restart coturn
 sleep 1
 
-# 把 443/udp 转发到 coturn 的 3478：校园/公司网常对杂牌端口 UDP 限速，
-# 但不敢限 443/udp（QUIC）。客户端连 443，服务器内部转到 3478。
-# （需在云控制台防火墙放行 UDP 443）
-iptables -t nat -C PREROUTING -p udp --dport 443 -j REDIRECT --to-ports 3478 2>/dev/null \
-  || iptables -t nat -A PREROUTING -p udp --dport 443 -j REDIRECT --to-ports 3478
-# 持久化，重启不丢
+# iptables 持久化工具（443/udp 已归 OBS 推流服务使用，见 mediamtx-setup.sh）
 echo 'iptables-persistent iptables-persistent/autosave_v4 boolean true' | debconf-set-selections
 echo 'iptables-persistent iptables-persistent/autosave_v6 boolean true' | debconf-set-selections
 DEBIAN_FRONTEND=noninteractive apt-get install -y iptables-persistent >/dev/null 2>&1

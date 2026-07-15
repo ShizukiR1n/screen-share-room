@@ -18,10 +18,9 @@ app.use(express.static(path.join(__dirname, 'public')));
 // 3. Cloudflare 临时凭据：CF_TURN_KEY_ID + CF_TURN_API_TOKEN
 const TURN_HOST = process.env.TURN_HOST;
 const TURN_SECRET = process.env.TURN_SECRET;
-// 对外公布的中继端口默认 443（QUIC 端口）：很多校园/公司网对"杂牌端口"的 UDP 限速，
-// 但绝不敢限 443/udp（会拖垮 Chrome 的 QUIC）。服务器用 iptables 把 443/udp 转发到
-// coturn 实际监听的 3478（见 deploy/coturn-setup.sh）
-const TURN_PORT = process.env.TURN_PORT || 443;
+// coturn 中继端口。443/udp（QUIC 端口，校园/公司网不敢限速）已让给 OBS 推流的
+// 媒体端口（见下方 MediaMTX 配置），浏览器共享模式的中继回到标准 3478
+const TURN_PORT = process.env.TURN_PORT || 3478;
 const TURN_URLS = process.env.TURN_URLS;
 const TURN_USERNAME = process.env.TURN_USERNAME;
 const TURN_CREDENTIAL = process.env.TURN_CREDENTIAL;
@@ -29,16 +28,26 @@ const CF_TURN_KEY_ID = process.env.CF_TURN_KEY_ID;
 const CF_TURN_API_TOKEN = process.env.CF_TURN_API_TOKEN;
 let iceCache = { until: 0, servers: [] };
 
+// OBS 推流模式：OBS 用 WHIP 把编码好的画面推到自建 MediaMTX（与 coturn 同一台服务器），
+// 观看端用 WHEP 从 MediaMTX 拉流。本服务只代理信令（SDP 交换，每次几 KB），
+// 媒体流量直接走 浏览器/OBS ↔ MediaMTX 的 UDP，不经过这里。
+// 走代理的原因：页面是 HTTPS，浏览器直连 MediaMTX 的 HTTP 接口会被拦（混合内容）；
+// 代理还能统一注入鉴权、对外隐藏媒体服务器地址。
+const MTX_PUBLISH_PASS = process.env.MTX_PUBLISH_PASS; // OBS 推流密码（兼作推流地址里的令牌）
+const MTX_READ_PASS = process.env.MTX_READ_PASS;       // 观看端拉流密码（仅代理内部使用）
+const MTX_HTTP_PORT = process.env.MTX_HTTP_PORT || 8889;
+const MTX_PATH = process.env.MTX_PATH || 'beam';
+// MediaMTX 媒体端口 443/udp 的备用入口：个别网络出不去 443/udp（实测遇到过），
+// 服务器 iptables 把 8189/udp 转发到 443，代理往 SDP answer 里补一份 8189 候选兜底
+const MTX_UDP_FALLBACK_PORT = 8189;
+const OBS_ENABLED = !!(TURN_HOST && MTX_PUBLISH_PASS && MTX_READ_PASS);
+
 app.get('/api/ice', async (req, res) => {
   if (TURN_HOST && TURN_SECRET) {
     // coturn use-auth-secret：用户名为过期时间戳，凭据为 HMAC-SHA1 签名
     const username = String(Math.floor(Date.now() / 1000) + 12 * 3600);
     const credential = crypto.createHmac('sha1', TURN_SECRET).update(username).digest('base64');
-    // 只提供 UDP 中继（TCP 中继会导致拥塞控制死亡螺旋，绝不使用）。
-    // 同时公布两个 UDP 端口，排前的优先：
-    //   443  —— QUIC 端口，绕开校园/公司网对杂牌端口 UDP 的限速
-    //   3478 —— 标准端口，兜底个别网络反而封 443/udp 的情况（如部分家用路由）
-    // 每个客户端各自用能通的端口分配中继，互不影响
+    // 只提供 UDP 中继（TCP 中继会导致拥塞控制死亡螺旋，绝不使用）
     const ports = [...new Set([Number(TURN_PORT), 3478])];
     return res.json({
       iceServers: ports.map((p) => ({
@@ -84,10 +93,97 @@ app.get('/api/ice', async (req, res) => {
   }
 });
 
+/* ================= OBS 推流（WHIP/WHEP 信令代理） ================= */
+
+// WHIP/WHEP 的信令就是普通 HTTP：POST 一份 SDP offer，返回 SDP answer 和会话地址
+const sdpBody = express.text({
+  type: ['application/sdp', 'application/trickle-ice-sdpfrag'],
+  limit: '1mb',
+});
+
+function mtxAuth(kind) {
+  const user = kind === 'whip' ? 'publisher' : 'viewer';
+  const pass = kind === 'whip' ? MTX_PUBLISH_PASS : MTX_READ_PASS;
+  return 'Basic ' + Buffer.from(`${user}:${pass}`).toString('base64');
+}
+
+function mtxUrl(tail) {
+  return `http://${TURN_HOST}:${MTX_HTTP_PORT}/${MTX_PATH}/${tail}`;
+}
+
+// 给 SDP answer 里服务器的 443 候选补一份低优先级的备用端口副本：
+// 个别网络出不去 443/udp，ICE 会自动改走备用端口（与中继双端口是同一个教训）
+function addFallbackCandidates(sdp) {
+  return sdp.split('\r\n').flatMap((line) => {
+    const m = line.match(/^a=candidate:(\S+) (\d+) (udp|UDP) (\d+) (\S+) 443 (typ host.*)$/i);
+    if (!m) return [line];
+    const prio = Math.max(1, Number(m[4]) - 1);
+    return [line, `a=candidate:${m[1]}9 ${m[2]} ${m[3]} ${prio} ${m[5]} ${MTX_UDP_FALLBACK_PORT} ${m[6]}`];
+  }).join('\r\n');
+}
+
+// 建立会话：转发 SDP offer，把 MediaMTX 返回的会话地址改写成本站路径
+async function proxyMtxPost(req, res, kind) {
+  if (!OBS_ENABLED) return res.status(503).end('OBS mode not configured');
+  try {
+    const r = await fetch(mtxUrl(kind), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/sdp', Authorization: mtxAuth(kind) },
+      body: req.body,
+    });
+    const text = await r.text();
+    if (r.status !== 201) return res.status(r.status).end(text);
+    const sid = String(r.headers.get('location') || '').split('/').filter(Boolean).pop();
+    res.status(201)
+      .set('Content-Type', 'application/sdp')
+      .set('Location', `/${kind}-session/${sid}`)
+      .end(addFallbackCandidates(text));
+  } catch (err) {
+    console.error(`代理 ${kind} 失败:`, err.message);
+    res.status(502).end('media server unreachable');
+  }
+}
+
+// 会话内操作：PATCH（补发 ICE 候选）与 DELETE（结束会话）原样转发
+async function proxyMtxSession(req, res, kind) {
+  if (!OBS_ENABLED) return res.status(503).end();
+  try {
+    const r = await fetch(mtxUrl(`${kind}/${encodeURIComponent(req.params.sid)}`), {
+      method: req.method,
+      headers: {
+        Authorization: mtxAuth(kind),
+        ...(req.method === 'PATCH' ? { 'Content-Type': 'application/trickle-ice-sdpfrag' } : {}),
+      },
+      body: req.method === 'PATCH' ? req.body : undefined,
+    });
+    res.status(r.status).end(await r.text());
+  } catch {
+    res.status(502).end();
+  }
+}
+
+// OBS 推流入口：地址里带令牌，防陌生人往房间里推画面
+app.post('/whip/:token', sdpBody, (req, res) => {
+  if (!OBS_ENABLED || req.params.token !== MTX_PUBLISH_PASS) return res.status(401).end();
+  proxyMtxPost(req, res, 'whip');
+});
+app.patch('/whip-session/:sid', sdpBody, (req, res) => proxyMtxSession(req, res, 'whip'));
+app.delete('/whip-session/:sid', (req, res) => proxyMtxSession(req, res, 'whip'));
+
+// 观看端拉流入口：需报上自己所在的房间，且该房间正处于 OBS 直播中
+app.post('/whep', sdpBody, (req, res) => {
+  const room = rooms.get(String(req.get('X-Room') || '').trim().toUpperCase());
+  if (!room || room.presenterMode !== 'obs') return res.status(404).end();
+  proxyMtxPost(req, res, 'whep');
+});
+app.patch('/whep-session/:sid', sdpBody, (req, res) => proxyMtxSession(req, res, 'whep'));
+app.delete('/whep-session/:sid', (req, res) => proxyMtxSession(req, res, 'whep'));
+
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
-// code -> { code, members: Map<id, {id, name, ws}>, presenterId }
+// code -> { code, members: Map<id, {id, name, ws}>, presenterId, presenterMode }
+// presenterMode: 'p2p'（浏览器共享）| 'obs'（OBS 推流）| null
 const rooms = new Map();
 
 // 去掉易混淆字符（0/O、1/I）的房间码字母表
@@ -140,6 +236,8 @@ function sendJoined(ws, room, member) {
     token: member.token,
     members: memberList(room),
     presenterId: room.presenterId,
+    presenterMode: room.presenterMode || null,
+    obsAvailable: OBS_ENABLED,
   });
 }
 
@@ -157,7 +255,7 @@ wss.on('connection', (ws) => {
     switch (msg.type) {
       case 'create-room': {
         if (self) return;
-        const room = { code: genRoomCode(), members: new Map(), presenterId: null };
+        const room = { code: genRoomCode(), members: new Map(), presenterId: null, presenterMode: null };
         rooms.set(room.code, room);
         const member = addMember(ws, room, cleanName(msg.name));
         self = { id: member.id, name: member.name, room };
@@ -212,12 +310,27 @@ wss.on('connection', (ws) => {
       case 'request-share': {
         if (!self) return;
         const room = self.room;
+        const mode = msg.mode === 'obs' ? 'obs' : 'p2p';
         if (room.presenterId && room.presenterId !== self.id) {
           return send(ws, { type: 'share-denied' });
         }
+        if (mode === 'obs') {
+          if (!OBS_ENABLED) return send(ws, { type: 'share-denied', reason: 'obs-unavailable' });
+          // MediaMTX 上只有一条固定推流路径，同一时间只能有一个房间用 OBS 直播
+          for (const r of rooms.values()) {
+            if (r !== room && r.presenterMode === 'obs') {
+              return send(ws, { type: 'share-denied', reason: 'obs-busy' });
+            }
+          }
+        }
         room.presenterId = self.id;
-        send(ws, { type: 'share-granted' });
-        broadcast(room, { type: 'presenter-changed', presenterId: self.id });
+        room.presenterMode = mode;
+        send(ws, {
+          type: 'share-granted',
+          mode,
+          ...(mode === 'obs' ? { whipPath: `/whip/${MTX_PUBLISH_PASS}` } : {}),
+        });
+        broadcast(room, { type: 'presenter-changed', presenterId: self.id, mode });
         break;
       }
 
@@ -226,6 +339,7 @@ wss.on('connection', (ws) => {
         const room = self.room;
         if (room.presenterId !== self.id) return;
         room.presenterId = null;
+        room.presenterMode = null;
         broadcast(room, { type: 'presenter-changed', presenterId: null });
         break;
       }
@@ -251,6 +365,7 @@ wss.on('connection', (ws) => {
     room.members.delete(self.id);
     if (room.presenterId === self.id) {
       room.presenterId = null;
+      room.presenterMode = null;
       broadcast(room, { type: 'presenter-changed', presenterId: null });
     }
     broadcast(room, { type: 'peer-left', id: self.id });

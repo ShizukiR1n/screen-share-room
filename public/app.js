@@ -49,6 +49,9 @@ const state = {
   roomCode: null,
   members: new Map(),        // id -> { id, name }
   presenterId: null,
+  presenterMode: null,       // 'p2p'（浏览器共享）| 'obs'（OBS 推流）| null
+  obsAvailable: false,       // 服务器是否配置了 OBS 推流
+  whipPath: null,            // OBS 推流地址（仅当自己是 OBS 演示者时下发）
   peers: new Map(),          // peerId -> { pc, pending: [candidate] }
   localStream: null,
   remoteStream: null,
@@ -91,6 +94,12 @@ const el = {
   qualityPicker: $('quality-picker'),
   shareBtn: $('share-btn'),
   shareBtnText: $('share-btn-text'),
+  obsBtn: $('obs-btn'),
+  obsPanel: $('obs-panel'),
+  obsDot: $('obs-dot'),
+  obsStatus: $('obs-status'),
+  obsUrl: $('obs-url'),
+  obsCopyBtn: $('obs-copy-btn'),
   toasts: $('toasts'),
 };
 
@@ -172,6 +181,8 @@ function handleDisconnect() {
   if (!wasInRoom) {
     stopLocalShare(false);
     closeAllPeers();
+    stopWhep();
+    hideObsPanel();
     clearRemoteStage();
     state.roomCode = null;
     showView('home');
@@ -182,6 +193,8 @@ function handleDisconnect() {
   if (state.reconnectAttempts >= 8) {
     stopLocalShare(false);
     closeAllPeers();
+    stopWhep();
+    hideObsPanel();
     clearRemoteStage();
     toast('连接已断开，请刷新页面重试', 'error', 6000);
     state.roomCode = null;
@@ -216,6 +229,8 @@ function handleSignal(msg) {
       state.selfId = msg.selfId;
       state.token = msg.token;
       state.presenterId = msg.presenterId;
+      state.presenterMode = msg.presenterMode || (msg.presenterId ? 'p2p' : null);
+      state.obsAvailable = !!msg.obsAvailable;
       state.members = new Map(msg.members.map((m) => [m.id, m]));
       // 清理离线期间已离开成员的旧媒体连接
       for (const id of [...state.peers.keys()]) {
@@ -243,6 +258,18 @@ function handleSignal(msg) {
         } else if (state.presenterId && state.presenterId !== state.selfId) {
           setStageConnecting();
         }
+      }
+      // OBS 直播状态同步（新进房 / 断线恢复通用；startWhep 已在拉流时不会重复起）
+      if (state.presenterMode === 'obs') {
+        if (state.presenterId === state.selfId) {
+          if (!state.remoteStream) showObsPanel();
+        } else if (!state.remoteStream) {
+          setStageConnecting();
+        }
+        startWhep();
+      } else {
+        stopWhep();
+        hideObsPanel();
       }
       break;
     }
@@ -282,7 +309,10 @@ function handleSignal(msg) {
 
     case 'presenter-changed': {
       state.presenterId = msg.presenterId;
+      state.presenterMode = msg.presenterId ? (msg.mode || 'p2p') : null;
       if (msg.presenterId === null) {
+        stopWhep();
+        hideObsPanel();
         if (state.localStream) {
           // 我还在采集屏幕但锁被释放了（重连后旧身份被清理）：自动拿回共享权
           sendMsg({ type: 'request-share' });
@@ -292,16 +322,33 @@ function handleSignal(msg) {
           clearRemoteStage();
         }
       } else if (msg.presenterId !== state.selfId) {
-        // 别人开始共享，等待对方的 offer
         closeAllPeers();
-        toast(`${memberName(msg.presenterId)} 开始共享屏幕`, 'info');
-        setStageConnecting();
+        if (state.presenterMode === 'obs') {
+          // 别人开始 OBS 直播：从服务器拉流
+          toast(`${memberName(msg.presenterId)} 开始了 OBS 直播`, 'info');
+          setStageConnecting();
+          startWhep();
+        } else {
+          // 别人开始浏览器共享，等待对方的 offer
+          stopWhep();
+          toast(`${memberName(msg.presenterId)} 开始共享屏幕`, 'info');
+          setStageConnecting();
+        }
       }
       renderRoom();
       break;
     }
 
     case 'share-granted': {
+      if (msg.mode === 'obs') {
+        state.presenterId = state.selfId;
+        state.presenterMode = 'obs';
+        state.whipPath = msg.whipPath;
+        showObsPanel();
+        startWhep(); // 自己也从服务器拉一路做预览（静音）
+        renderRoom();
+        break;
+      }
       if (state.localStream) {
         // 重连后复用仍在采集的画面，直接向所有人重新推流
         state.presenterId = state.selfId;
@@ -320,7 +367,9 @@ function handleSignal(msg) {
     }
 
     case 'share-denied': {
-      toast('已有人在共享屏幕', 'warn');
+      if (msg.reason === 'obs-busy') toast('另一个房间正在使用 OBS 直播，请稍后再试', 'warn');
+      else if (msg.reason === 'obs-unavailable') toast('服务器未配置 OBS 推流', 'warn');
+      else toast('已有人在共享屏幕', 'warn');
       break;
     }
 
@@ -502,6 +551,10 @@ function stopStats() {
 async function updateStats() {
   const iAmPresenter = state.presenterId === state.selfId && !!state.localStream;
   const entries = [...state.peers.entries()].filter(([, p]) => p.pc.connectionState === 'connected');
+  // OBS 模式下大家（含演示者的预览）都是从服务器收流，按观看端口径统计
+  if (whep.pc && whep.pc.connectionState === 'connected') {
+    entries.push(['whep', { pc: whep.pc }]);
+  }
   if (!entries.length) { el.statsLine.textContent = ''; return; }
   try {
     if (iAmPresenter) {
@@ -573,6 +626,147 @@ function closeAllPeers() {
   for (const id of [...state.peers.keys()]) closePeer(id);
 }
 
+/* ================= OBS 直播（WHEP 从服务器拉流） ================= */
+// OBS 用 WHIP 把画面推到自建媒体服务器，房间里每个人（含演示者自己的预览）
+// 都通过 WHEP 从服务器拉流。信令走本站代理，媒体是浏览器↔服务器的直接 UDP。
+
+const whep = { pc: null, timer: null, active: false, sessionUrl: null };
+
+function startWhep() {
+  if (whep.active) return;
+  whep.active = true;
+  whepAttempt();
+}
+
+function stopWhep() {
+  if (!whep.active && !whep.pc) return;
+  whep.active = false;
+  clearTimeout(whep.timer);
+  whep.timer = null;
+  if (whep.sessionUrl) {
+    fetch(whep.sessionUrl, { method: 'DELETE' }).catch(() => {});
+    whep.sessionUrl = null;
+  }
+  if (whep.pc) {
+    whep.pc.ontrack = null;
+    whep.pc.onconnectionstatechange = null;
+    whep.pc.close();
+    whep.pc = null;
+  }
+}
+
+function scheduleWhepRetry(ms) {
+  if (!whep.active) return;
+  clearTimeout(whep.timer);
+  whep.timer = setTimeout(whepAttempt, ms);
+}
+
+// 等 ICE 候选收集完（一次性放进 offer，省去逐条补发）
+function waitIceComplete(pc) {
+  if (pc.iceGatheringState === 'complete') return Promise.resolve();
+  return new Promise((resolve) => {
+    const to = setTimeout(resolve, 2000); // 超时就带着已有候选继续
+    pc.addEventListener('icegatheringstatechange', () => {
+      if (pc.iceGatheringState === 'complete') { clearTimeout(to); resolve(); }
+    });
+  });
+}
+
+async function whepAttempt() {
+  if (!whep.active) return;
+  if (whep.sessionUrl) {
+    fetch(whep.sessionUrl, { method: 'DELETE' }).catch(() => {});
+    whep.sessionUrl = null;
+  }
+  if (whep.pc) whep.pc.close();
+
+  const iAmPresenter = state.presenterId === state.selfId;
+  // 服务器有公网地址，直连优先；带上中继凭据兜底完全出不去 UDP 的网络
+  const pc = new RTCPeerConnection({ iceServers });
+  whep.pc = pc;
+  pc.addTransceiver('video', { direction: 'recvonly' });
+  pc.addTransceiver('audio', { direction: 'recvonly' });
+
+  pc.ontrack = (ev) => {
+    if (pc !== whep.pc) return;
+    if (ev.streams && ev.streams[0]) attachRemoteStream(ev.streams[0], iAmPresenter);
+  };
+
+  pc.onconnectionstatechange = () => {
+    if (pc !== whep.pc || !whep.active) return;
+    const s = pc.connectionState;
+    if (s === 'connected') {
+      setObsLive(true);
+      startStats();
+    } else if (s === 'failed' || s === 'disconnected' || s === 'closed') {
+      // OBS 停止推流或网络中断：回到等待状态，静默重试
+      onWhepDown();
+      scheduleWhepRetry(1500);
+    }
+  };
+
+  try {
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    await waitIceComplete(pc);
+    const r = await fetch('/whep', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/sdp', 'X-Room': state.roomCode || '' },
+      body: pc.localDescription.sdp,
+    });
+    if (r.status !== 201) throw new Error('推流尚未开始');
+    whep.sessionUrl = r.headers.get('Location');
+    const answer = await r.text();
+    if (pc !== whep.pc) return;
+    await pc.setRemoteDescription({ type: 'answer', sdp: answer });
+  } catch {
+    scheduleWhepRetry(2000); // OBS 还没开播/暂时失败：过两秒再试
+  }
+}
+
+// 拉流断开：清画面、回到各自的等待状态
+function onWhepDown() {
+  if (state.remoteStream) {
+    state.remoteStream = null;
+    el.stageVideo.srcObject = null;
+  }
+  stopStats();
+  setObsLive(false);
+  if (state.presenterId === state.selfId) showObsPanel();
+  else if (state.presenterMode === 'obs') setStageConnecting();
+}
+
+/* ---------- OBS 推流面板（仅演示者） ---------- */
+
+function showObsPanel() {
+  if (!state.whipPath) return;
+  el.obsUrl.textContent = location.origin + state.whipPath;
+  setObsLive(false);
+  el.obsPanel.classList.remove('hidden');
+}
+
+function hideObsPanel() {
+  el.obsPanel.classList.add('hidden');
+}
+
+function setObsLive(live) {
+  el.obsDot.classList.toggle('live', live);
+  el.obsStatus.textContent = live
+    ? '直播中 · 房间里所有人都能看到'
+    : '等待 OBS 开始推流…';
+}
+
+function stopObsShare() {
+  sendMsg({ type: 'stop-share' });
+  stopWhep();
+  hideObsPanel();
+  state.presenterId = null;
+  state.presenterMode = null;
+  state.remoteStream = null;
+  clearRemoteStage();
+  renderRoom();
+}
+
 /* ================= 共享流程 ================= */
 
 async function startCapture() {
@@ -634,6 +828,10 @@ function stopLocalShare(notifyServer) {
 }
 
 function onShareClick() {
+  if (state.presenterId === state.selfId && state.presenterMode === 'obs') {
+    stopObsShare();
+    return;
+  }
   if (!CAN_SHARE) {
     toast('这台设备的浏览器不支持共享屏幕（手机/平板一般只能观看），请用电脑共享', 'warn', 5000);
     return;
@@ -651,9 +849,19 @@ function onShareClick() {
 
 /* ================= 舞台 / UI ================= */
 
-function attachRemoteStream(stream) {
+function attachRemoteStream(stream, asObsPreview = false) {
   state.remoteStream = stream;
   el.stageVideo.srcObject = stream;
+  if (asObsPreview) {
+    // 演示者看自己的 OBS 画面：必须静音，否则和本机声音叠成回声
+    el.stageVideo.muted = true;
+    setStageMode('local');
+    el.presenterLabel.textContent = '你正在通过 OBS 直播 · 其他人可以看到并听到';
+    el.stageVideo.play().catch(() => {});
+    hideObsPanel();
+    showControls();
+    return;
+  }
   el.stageVideo.muted = false;
   el.stageVideo.volume = el.volumeSlider.value / 100;
   setStageMode('remote');
@@ -681,8 +889,13 @@ function clearRemoteStage() {
 // 演示者已在共享但画面还没送达时的等待状态
 function setStageConnecting() {
   if (state.remoteStream) return;
-  el.emptyTitle.textContent = `正在连接 ${memberName(state.presenterId)} 的画面…`;
-  el.emptyHint.textContent = '通常几秒内出现；如长时间无画面，双方网络可能受限';
+  if (state.presenterMode === 'obs') {
+    el.emptyTitle.textContent = `等待 ${memberName(state.presenterId)} 的 OBS 画面…`;
+    el.emptyHint.textContent = '对方在 OBS 里点「开始直播」后，画面会自动出现';
+  } else {
+    el.emptyTitle.textContent = `正在连接 ${memberName(state.presenterId)} 的画面…`;
+    el.emptyHint.textContent = '通常几秒内出现；如长时间无画面，双方网络可能受限';
+  }
   setStageMode('empty');
 }
 
@@ -772,6 +985,10 @@ function renderRoom() {
     el.shareBtn.classList.remove('unsupported');
   }
 
+  // OBS 推流按钮：电脑端 + 服务器已配置时可见；自己已在共享时收起
+  el.obsBtn.classList.toggle('hidden', !CAN_SHARE || !state.obsAvailable || iAmPresenter);
+  el.obsBtn.disabled = !!someoneElse;
+
   updateQualityUI();
 }
 
@@ -823,30 +1040,36 @@ function leaveRoom() {
   state.intentionalLeave = true;
   stopLocalShare(false);
   closeAllPeers();
+  stopWhep();
+  hideObsPanel();
   clearRemoteStage();
   if (state.ws) state.ws.close();
   state.roomCode = null;
   state.presenterId = null;
+  state.presenterMode = null;
+  state.whipPath = null;
   state.members.clear();
   history.replaceState(null, '', location.pathname);
   showView('home');
 }
 
-async function copyInviteLink() {
-  const link = `${location.origin}${location.pathname}?room=${state.roomCode}`;
+async function copyText(text, okMsg) {
   try {
-    await navigator.clipboard.writeText(link);
-    toast('邀请链接已复制，发给朋友吧', 'success');
+    await navigator.clipboard.writeText(text);
   } catch {
     // 非 HTTPS 环境的降级方案
     const ta = document.createElement('textarea');
-    ta.value = link;
+    ta.value = text;
     document.body.appendChild(ta);
     ta.select();
     document.execCommand('copy');
     ta.remove();
-    toast('邀请链接已复制，发给朋友吧', 'success');
   }
+  toast(okMsg, 'success');
+}
+
+function copyInviteLink() {
+  copyText(`${location.origin}${location.pathname}?room=${state.roomCode}`, '邀请链接已复制，发给朋友吧');
 }
 
 /* ================= 事件绑定 ================= */
@@ -856,6 +1079,19 @@ el.joinBtn.addEventListener('click', joinRoom);
 el.leaveBtn.addEventListener('click', leaveRoom);
 el.copyLinkBtn.addEventListener('click', copyInviteLink);
 el.shareBtn.addEventListener('click', onShareClick);
+
+el.obsBtn.addEventListener('click', () => {
+  if (state.presenterId && state.presenterId !== state.selfId) {
+    toast(`${memberName(state.presenterId)} 正在共享中`, 'warn');
+    return;
+  }
+  if (state.presenterId === state.selfId) return; // 已在共享
+  sendMsg({ type: 'request-share', mode: 'obs' });
+});
+
+el.obsCopyBtn.addEventListener('click', () => {
+  copyText(el.obsUrl.textContent, '推流地址已复制，粘贴到 OBS 的「服务器」栏');
+});
 
 el.qualityPicker.addEventListener('click', (e) => {
   const btn = e.target.closest('button[data-q]');

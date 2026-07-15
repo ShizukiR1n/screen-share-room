@@ -340,6 +340,77 @@ body {
 .empty-title { font-size: 17px; font-weight: 600; margin-bottom: 8px; }
 .empty-hint { font-size: 13.5px; color: var(--text-muted); }
 
+/* --- OBS 推流面板（覆盖在舞台上，仅演示者可见） --- */
+.obs-panel {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  background: rgba(8, 10, 18, 0.92);
+  backdrop-filter: blur(8px);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  padding: 28px;
+  text-align: center;
+  animation: rise 0.4s ease both;
+}
+.obs-panel h3 {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 19px;
+  font-weight: 700;
+}
+.obs-dot {
+  width: 10px; height: 10px;
+  border-radius: 50%;
+  background: var(--warn);
+  box-shadow: 0 0 10px var(--warn);
+  animation: obs-blink 1.6s ease infinite;
+}
+.obs-dot.live {
+  background: var(--danger);
+  box-shadow: 0 0 12px var(--danger);
+  animation: none;
+}
+@keyframes obs-blink { 50% { opacity: 0.35; } }
+.obs-status { color: var(--text-muted); font-size: 13.5px; }
+.obs-url-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: min(640px, 100%);
+}
+.obs-url-row code {
+  flex: 1;
+  min-width: 0;
+  font-size: 12.5px;
+  padding: 12px 14px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  user-select: all;
+}
+.obs-url-row .btn { flex-shrink: 0; width: auto; padding: 11px 18px; font-size: 13px; }
+.obs-steps {
+  width: min(560px, 100%);
+  text-align: left;
+  color: var(--text-muted);
+  font-size: 13px;
+  line-height: 1.9;
+  padding-left: 20px;
+}
+.obs-steps b { color: var(--text); }
+
+.btn-obs { padding: 13px 20px; border-radius: 14px; font-size: 14px; flex-shrink: 0; }
+.btn-obs svg { width: 17px; height: 17px; }
+
 .click-to-play {
   position: absolute;
   left: 0; right: 0; bottom: 0;

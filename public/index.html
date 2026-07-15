@@ -87,6 +87,24 @@
         <p class="empty-hint" id="empty-hint">点击下方「开始共享屏幕」，把你的画面带给大家</p>
       </div>
 
+      <!-- OBS 推流面板：仅演示者可见，等待/掉线时覆盖在舞台上 -->
+      <div class="obs-panel hidden" id="obs-panel">
+        <h3>
+          <span class="obs-dot" id="obs-dot"></span>
+          OBS 推流模式
+        </h3>
+        <p class="obs-status" id="obs-status">等待 OBS 开始推流…</p>
+        <div class="obs-url-row">
+          <code id="obs-url">…</code>
+          <button id="obs-copy-btn" class="btn btn-primary">复制推流地址</button>
+        </div>
+        <ol class="obs-steps">
+          <li>OBS「设置 → 直播」：服务选 <b>WHIP</b>，把上面的地址粘贴到「服务器」，Bearer 令牌留空</li>
+          <li>回到 OBS 主界面，点「<b>开始直播</b>」</li>
+          <li>画面会自动出现在这里，房间里所有人同步看到</li>
+        </ol>
+      </div>
+
       <div class="click-to-play hidden" id="click-to-play">
         <button id="play-btn" class="btn btn-primary">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -130,6 +148,12 @@
           <rect x="2" y="4" width="20" height="13" rx="3"/><path d="m9 13 3-3 3 3"/><path d="M12 10v6"/>
         </svg>
         <span id="share-btn-text">开始共享屏幕</span>
+      </button>
+      <button id="obs-btn" class="btn btn-ghost btn-obs hidden" title="用 OBS 推流：画质更好，可用显卡编码">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="3"/><path d="M12 3v2"/><path d="m18.4 8.6-1.8 1"/><path d="m5.6 8.6 1.8 1"/>
+        </svg>
+        <span>OBS 推流</span>
       </button>
     </footer>
   </main>
