@@ -1,2 +1,4 @@
 node_modules/
 .claude/
+# 含真实网址与推流密码，仅保留在本地
+OBS推流教程.md
