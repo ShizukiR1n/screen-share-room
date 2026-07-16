@@ -28,19 +28,22 @@ const CF_TURN_KEY_ID = process.env.CF_TURN_KEY_ID;
 const CF_TURN_API_TOKEN = process.env.CF_TURN_API_TOKEN;
 let iceCache = { until: 0, servers: [] };
 
-// OBS 推流模式：OBS 用 WHIP 把编码好的画面推到自建 MediaMTX（与 coturn 同一台服务器），
-// 观看端用 WHEP 从 MediaMTX 拉流。本服务只代理信令（SDP 交换，每次几 KB），
-// 媒体流量直接走 浏览器/OBS ↔ MediaMTX 的 UDP，不经过这里。
-// 走代理的原因：页面是 HTTPS，浏览器直连 MediaMTX 的 HTTP 接口会被拦（混合内容）；
-// 代理还能统一注入鉴权、对外隐藏媒体服务器地址。
-const MTX_PUBLISH_PASS = process.env.MTX_PUBLISH_PASS; // OBS 推流密码（兼作推流地址里的令牌）
-const MTX_READ_PASS = process.env.MTX_READ_PASS;       // 观看端拉流密码（仅代理内部使用）
-const MTX_HTTP_PORT = process.env.MTX_HTTP_PORT || 8889;
+// OBS 推流模式（全 TCP，绕开运营商对高速率 UDP 的限速）：
+//   上传：OBS 用 RTMP（TCP 1935）把画面推到自建 MediaMTX（与 coturn 同一台服务器）
+//   观看：浏览器用 HLS（HTTP/TCP）从 MediaMTX 拉流，经本服务代理（页面是 HTTPS，
+//        直连 MediaMTX 的 HTTP 会被浏览器按混合内容拦掉；代理同时注入鉴权、隐藏媒体服务器）
+// 之所以放弃 WHIP/WHEP(WebRTC/UDP)：实测移动宽带把 6Mbps 的上行 UDP 掐到 1Mbps
+// （TCP 却有 58Mbps），换 TCP 后任何网络都能高码率，代价是 HLS 有 1~3 秒延迟。
+const MTX_PUBLISH_PASS = process.env.MTX_PUBLISH_PASS; // OBS RTMP 推流密码
+const MTX_READ_PASS = process.env.MTX_READ_PASS;       // HLS 拉流密码（仅代理内部使用）
+const MTX_HLS_PORT = process.env.MTX_HLS_PORT || 8888;
+const MTX_RTMP_PORT = process.env.MTX_RTMP_PORT || 1935;
 const MTX_PATH = process.env.MTX_PATH || 'beam';
-// MediaMTX 媒体端口 443/udp 的备用入口：个别网络出不去 443/udp（实测遇到过），
-// 服务器 iptables 把 8189/udp 转发到 443，代理往 SDP answer 里补一份 8189 候选兜底
-const MTX_UDP_FALLBACK_PORT = 8189;
 const OBS_ENABLED = !!(TURN_HOST && MTX_PUBLISH_PASS && MTX_READ_PASS);
+// 给演示者显示的 RTMP 推流地址（含推流密码，仅下发给拿到共享权的本人）
+const RTMP_URL = OBS_ENABLED
+  ? `rtmp://${TURN_HOST}:${MTX_RTMP_PORT}/${MTX_PATH}?user=publisher&pass=${MTX_PUBLISH_PASS}`
+  : '';
 
 app.get('/api/ice', async (req, res) => {
   if (TURN_HOST && TURN_SECRET) {
@@ -93,91 +96,33 @@ app.get('/api/ice', async (req, res) => {
   }
 });
 
-/* ================= OBS 推流（WHIP/WHEP 信令代理） ================= */
+/* ================= OBS 推流观看（HLS 代理，全 TCP） ================= */
 
-// WHIP/WHEP 的信令就是普通 HTTP：POST 一份 SDP offer，返回 SDP answer 和会话地址
-const sdpBody = express.text({
-  type: ['application/sdp', 'application/trickle-ice-sdpfrag'],
-  limit: '1mb',
-});
-
-function mtxAuth(kind) {
-  const user = kind === 'whip' ? 'publisher' : 'viewer';
-  const pass = kind === 'whip' ? MTX_PUBLISH_PASS : MTX_READ_PASS;
-  return 'Basic ' + Buffer.from(`${user}:${pass}`).toString('base64');
-}
-
-function mtxUrl(tail) {
-  return `http://${TURN_HOST}:${MTX_HTTP_PORT}/${MTX_PATH}/${tail}`;
-}
-
-// 给 SDP answer 里服务器的 443 候选补一份低优先级的备用端口副本：
-// 个别网络出不去 443/udp，ICE 会自动改走备用端口（与中继双端口是同一个教训）
-function addFallbackCandidates(sdp) {
-  return sdp.split('\r\n').flatMap((line) => {
-    const m = line.match(/^a=candidate:(\S+) (\d+) (udp|UDP) (\d+) (\S+) 443 (typ host.*)$/i);
-    if (!m) return [line];
-    const prio = Math.max(1, Number(m[4]) - 1);
-    return [line, `a=candidate:${m[1]}9 ${m[2]} ${m[3]} ${prio} ${m[5]} ${MTX_UDP_FALLBACK_PORT} ${m[6]}`];
-  }).join('\r\n');
-}
-
-// 建立会话：转发 SDP offer，把 MediaMTX 返回的会话地址改写成本站路径
-async function proxyMtxPost(req, res, kind) {
-  if (!OBS_ENABLED) return res.status(503).end('OBS mode not configured');
-  try {
-    const r = await fetch(mtxUrl(kind), {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/sdp', Authorization: mtxAuth(kind) },
-      body: req.body,
-    });
-    const text = await r.text();
-    if (r.status !== 201) return res.status(r.status).end(text);
-    const sid = String(r.headers.get('location') || '').split('/').filter(Boolean).pop();
-    res.status(201)
-      .set('Content-Type', 'application/sdp')
-      .set('Location', `/${kind}-session/${sid}`)
-      .end(addFallbackCandidates(text));
-  } catch (err) {
-    console.error(`代理 ${kind} 失败:`, err.message);
-    res.status(502).end('media server unreachable');
-  }
-}
-
-// 会话内操作：PATCH（补发 ICE 候选）与 DELETE（结束会话）原样转发
-async function proxyMtxSession(req, res, kind) {
+// 观看端 HLS 拉流：浏览器请求 /hls/<房间码>/<文件>，本服务带鉴权转发到 MediaMTX。
+// MediaMTX 全局只有一条推流路径（MTX_PATH），所有房间共用；房间码只用来校验
+// 该房间确实处于 OBS 直播中（防止拿到 IP 的陌生人直接扒流）。
+// m3u8 里的分片名是相对路径，浏览器会自动带上 /hls/<房间码>/ 前缀再打回本代理。
+app.get('/hls/:room/*', async (req, res) => {
   if (!OBS_ENABLED) return res.status(503).end();
+  const room = rooms.get(String(req.params.room || '').trim().toUpperCase());
+  if (!room || room.presenterMode !== 'obs') return res.status(404).end();
+  const file = req.params[0]; // index.m3u8 或分片文件名
+  // HLS 鉴权用查询参数（user/pass）；每个分片请求都要带
+  const q = `user=viewer&pass=${encodeURIComponent(MTX_READ_PASS)}`;
+  const sep = file.includes('?') ? '&' : '?';
   try {
-    const r = await fetch(mtxUrl(`${kind}/${encodeURIComponent(req.params.sid)}`), {
-      method: req.method,
-      headers: {
-        Authorization: mtxAuth(kind),
-        ...(req.method === 'PATCH' ? { 'Content-Type': 'application/trickle-ice-sdpfrag' } : {}),
-      },
-      body: req.method === 'PATCH' ? req.body : undefined,
-    });
-    res.status(r.status).end(await r.text());
-  } catch {
+    const r = await fetch(`http://${TURN_HOST}:${MTX_HLS_PORT}/${MTX_PATH}/${file}${sep}${q}`);
+    const buf = Buffer.from(await r.arrayBuffer());
+    const ct = r.headers.get('content-type');
+    if (ct) res.set('Content-Type', ct);
+    // m3u8 播放列表禁止缓存（低延迟直播每秒都在变），分片可短缓存
+    res.set('Cache-Control', file.endsWith('.m3u8') ? 'no-cache, no-store' : 'max-age=10');
+    res.status(r.status).end(buf);
+  } catch (err) {
+    console.error('代理 HLS 失败:', err.message);
     res.status(502).end();
   }
-}
-
-// OBS 推流入口：地址里带令牌，防陌生人往房间里推画面
-app.post('/whip/:token', sdpBody, (req, res) => {
-  if (!OBS_ENABLED || req.params.token !== MTX_PUBLISH_PASS) return res.status(401).end();
-  proxyMtxPost(req, res, 'whip');
 });
-app.patch('/whip-session/:sid', sdpBody, (req, res) => proxyMtxSession(req, res, 'whip'));
-app.delete('/whip-session/:sid', (req, res) => proxyMtxSession(req, res, 'whip'));
-
-// 观看端拉流入口：需报上自己所在的房间，且该房间正处于 OBS 直播中
-app.post('/whep', sdpBody, (req, res) => {
-  const room = rooms.get(String(req.get('X-Room') || '').trim().toUpperCase());
-  if (!room || room.presenterMode !== 'obs') return res.status(404).end();
-  proxyMtxPost(req, res, 'whep');
-});
-app.patch('/whep-session/:sid', sdpBody, (req, res) => proxyMtxSession(req, res, 'whep'));
-app.delete('/whep-session/:sid', (req, res) => proxyMtxSession(req, res, 'whep'));
 
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
@@ -328,7 +273,7 @@ wss.on('connection', (ws) => {
         send(ws, {
           type: 'share-granted',
           mode,
-          ...(mode === 'obs' ? { whipPath: `/whip/${MTX_PUBLISH_PASS}` } : {}),
+          ...(mode === 'obs' ? { rtmpUrl: RTMP_URL } : {}),
         });
         broadcast(room, { type: 'presenter-changed', presenterId: self.id, mode });
         break;
