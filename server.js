@@ -106,12 +106,16 @@ app.get('/hls/:room/*', async (req, res) => {
   if (!OBS_ENABLED) return res.status(503).end();
   const room = rooms.get(String(req.params.room || '').trim().toUpperCase());
   if (!room || room.presenterMode !== 'obs') return res.status(404).end();
-  const file = req.params[0]; // index.m3u8 或分片文件名
-  // HLS 鉴权用查询参数（user/pass）；每个分片请求都要带
-  const q = `user=viewer&pass=${encodeURIComponent(MTX_READ_PASS)}`;
-  const sep = file.includes('?') ? '&' : '?';
+  const file = req.params[0]; // index.m3u8 / 子播放列表 / 分片文件名
+  // 保留原始查询串（低延迟 HLS 的 _HLS_msn/_HLS_part 阻塞式拉取要靠它）
+  const qi = req.originalUrl.indexOf('?');
+  const qs = qi >= 0 ? req.originalUrl.slice(qi) : '';
+  // MediaMTX 的 HLS 鉴权只认 HTTP Basic（查询参数 user/pass 会被拒 401）
+  const auth = 'Basic ' + Buffer.from(`viewer:${MTX_READ_PASS}`).toString('base64');
   try {
-    const r = await fetch(`http://${TURN_HOST}:${MTX_HLS_PORT}/${MTX_PATH}/${file}${sep}${q}`);
+    const r = await fetch(`http://${TURN_HOST}:${MTX_HLS_PORT}/${MTX_PATH}/${file}${qs}`, {
+      headers: { Authorization: auth },
+    });
     const buf = Buffer.from(await r.arrayBuffer());
     const ct = r.headers.get('content-type');
     if (ct) res.set('Content-Type', ct);
