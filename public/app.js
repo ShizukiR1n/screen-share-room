@@ -52,6 +52,7 @@ const state = {
   presenterMode: null,       // 'p2p'（浏览器共享）| 'obs'（OBS 推流）| null
   obsAvailable: false,       // 服务器是否配置了 OBS 推流
   rtmpUrl: null,             // OBS RTMP 推流地址（仅当自己是 OBS 演示者时下发）
+  hlsDirect: null,           // 直连媒体服务器的播放地址（快，跨境代理只有 ~2Mbps）
   peers: new Map(),          // peerId -> { pc, pending: [candidate] }
   localStream: null,
   remoteStream: null,
@@ -231,6 +232,7 @@ function handleSignal(msg) {
       state.presenterId = msg.presenterId;
       state.presenterMode = msg.presenterMode || (msg.presenterId ? 'p2p' : null);
       state.obsAvailable = !!msg.obsAvailable;
+      state.hlsDirect = msg.hlsDirect || null;
       state.members = new Map(msg.members.map((m) => [m.id, m]));
       // 清理离线期间已离开成员的旧媒体连接
       for (const id of [...state.peers.keys()]) {
@@ -629,16 +631,32 @@ function closeAllPeers() {
 // 都通过 HLS(HTTP/TCP) 从服务器拉流，经本站代理。全程 TCP，绕开运营商对 UDP 的限速。
 // 代价是有 1~3 秒延迟。OBS 未开播时 m3u8 会 404，静默重试直到出流。
 
-const hls = { inst: null, active: false, timer: null, live: false };
+const hls = { inst: null, active: false, timer: null, live: false, srcIdx: 0, fails: 0 };
 
-function hlsSrc() {
-  return `/hls/${encodeURIComponent(state.roomCode || '')}/index.m3u8`;
+// 播放地址按优先级排列：直连媒体服务器（国内链路，几十 Mbps）优先，
+// 经 Render 的 /hls 代理垫底（跨境只有 ~2Mbps，只能兜低码率的底）。
+// 连续失败 2 次就换下一个地址轮询，出画后归零。
+function hlsSrcs() {
+  const list = [];
+  if (state.hlsDirect) list.push(state.hlsDirect);
+  list.push(`/hls/${encodeURIComponent(state.roomCode || '')}/index.m3u8`);
+  return list;
+}
+
+function hlsFail() {
+  hls.fails += 1;
+  if (hls.fails >= 2) {
+    hls.fails = 0;
+    hls.srcIdx += 1;
+  }
 }
 
 function startHls() {
   if (hls.active) return;
   hls.active = true;
   hls.live = false;
+  hls.srcIdx = 0;
+  hls.fails = 0;
   hlsAttempt();
 }
 
@@ -662,6 +680,8 @@ function hlsAttempt() {
   if (!hls.active) return;
   const iAmPresenter = state.presenterId === state.selfId;
   const video = el.stageVideo;
+  const srcs = hlsSrcs();
+  const src = srcs[hls.srcIdx % srcs.length];
   video.srcObject = null; // HLS 走 <video>.src / MSE，不是 srcObject
   // 演示者看自己的画面：静音（避免和本机声音叠成回声）；观看者正常出声
   video.muted = iAmPresenter;
@@ -671,7 +691,8 @@ function hlsAttempt() {
   const onLive = () => {
     if (!hls.active || hls.live) return;
     hls.live = true;
-    onHlsPlaying(iAmPresenter);
+    hls.fails = 0;
+    onHlsPlaying(iAmPresenter, src);
   };
 
   if (window.Hls && window.Hls.isSupported()) {
@@ -686,7 +707,7 @@ function hlsAttempt() {
       fragLoadingMaxRetry: 6,
     });
     hls.inst = inst;
-    inst.loadSource(hlsSrc());
+    inst.loadSource(src);
     inst.attachMedia(video);
     inst.on(window.Hls.Events.FRAG_BUFFERED, onLive);
     inst.on(window.Hls.Events.ERROR, (_e, data) => {
@@ -697,27 +718,37 @@ function hlsAttempt() {
         try { inst.recoverMediaError(); return; } catch { /* 落到下面重建 */ }
       }
       hls.live = false;
+      hlsFail();
       try { inst.destroy(); } catch { /* ignore */ }
       if (inst === hls.inst) hls.inst = null;
       onHlsDown();
       scheduleHlsRetry(2000);
     });
   } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-    // iOS/Safari 原生 HLS
-    video.src = hlsSrc();
+    // iOS/Safari 原生 HLS。必须主动 play()：原生路径没有 MSE 事件，
+    // 不播就永远等不到 playing；有声自动播被拦时降级为静音 + 点击开声
+    video.src = src;
     video.addEventListener('playing', onLive, { once: true });
     video.addEventListener('error', () => {
       if (!hls.active) return;
+      hlsFail();
       onHlsDown();
       scheduleHlsRetry(2000);
     }, { once: true });
+    video.play().catch(() => {
+      if (!hls.active || iAmPresenter) return;
+      video.muted = true;
+      video.play().catch(() => {});
+      el.clickToPlay.classList.remove('hidden');
+    });
   } else {
     toast('当前浏览器不支持观看 OBS 直播，请用 Chrome / Edge', 'error', 6000);
   }
 }
 
 // 首帧到达：真正把画面显示出来
-function onHlsPlaying(iAmPresenter) {
+function onHlsPlaying(iAmPresenter, src) {
+  const direct = !!src && src === state.hlsDirect;
   const video = el.stageVideo;
   setObsLive(true);
   state.remoteStream = null; // HLS 不用 MediaStream，占位标记有画面
@@ -739,7 +770,9 @@ function onHlsPlaying(iAmPresenter) {
       el.clickToPlay.classList.remove('hidden');
     });
   }
-  el.statsLine.textContent = 'OBS 直播 · HLS（约 1~3 秒延迟）';
+  el.statsLine.textContent = direct
+    ? 'OBS 直播 · 直连（约 2~4 秒延迟）'
+    : 'OBS 直播 · 中转（带宽有限，卡顿请降低 OBS 码率）';
 }
 
 // 拉流断开/未开播：清画面回到等待

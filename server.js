@@ -39,10 +39,20 @@ const MTX_READ_PASS = process.env.MTX_READ_PASS;       // HLS 拉流密码（仅
 const MTX_HLS_PORT = process.env.MTX_HLS_PORT || 8888;
 const MTX_RTMP_PORT = process.env.MTX_RTMP_PORT || 1935;
 const MTX_PATH = process.env.MTX_PATH || 'beam';
+// 观看端直连 MediaMTX 的 HTTPS 地址（如 https://8-134-66-167.sslip.io:8888）。
+// 实测经 Render 中转只有 ~2Mbps（跨境链路），直连国内服务器可达 60Mbps+，
+// 高码率（6~8Mbps）必须直连才放得动；未配置时回退到 /hls 代理（低码率可用）。
+// 直连路径（MTX_PATH）应设为长随机串当访问口令：读权限对该路径匿名开放
+// （Safari 原生 HLS 播放器带不了鉴权头），路径本身就是秘密。
+const MTX_HLS_PUBLIC = (process.env.MTX_HLS_PUBLIC || '').replace(/\/+$/, '');
 const OBS_ENABLED = !!(TURN_HOST && MTX_PUBLISH_PASS && MTX_READ_PASS);
 // 给演示者显示的 RTMP 推流地址（含推流密码，仅下发给拿到共享权的本人）
 const RTMP_URL = OBS_ENABLED
   ? `rtmp://${TURN_HOST}:${MTX_RTMP_PORT}/${MTX_PATH}?user=publisher&pass=${MTX_PUBLISH_PASS}`
+  : '';
+// 下发给房间成员的直连播放地址（仅进入 OBS 直播模式的房间成员可拿到）
+const HLS_DIRECT_URL = OBS_ENABLED && MTX_HLS_PUBLIC
+  ? `${MTX_HLS_PUBLIC}/${MTX_PATH}/index.m3u8`
   : '';
 
 app.get('/api/ice', async (req, res) => {
@@ -112,8 +122,10 @@ app.get('/hls/:room/*', async (req, res) => {
   const qs = qi >= 0 ? req.originalUrl.slice(qi) : '';
   // MediaMTX 的 HLS 鉴权只认 HTTP Basic（查询参数 user/pass 会被拒 401）
   const auth = 'Basic ' + Buffer.from(`viewer:${MTX_READ_PASS}`).toString('base64');
+  // 开启直连（MediaMTX 转 HTTPS）后，上游也走 HTTPS 域名（证书按域名校验）
+  const upstream = MTX_HLS_PUBLIC || `http://${TURN_HOST}:${MTX_HLS_PORT}`;
   try {
-    const r = await fetch(`http://${TURN_HOST}:${MTX_HLS_PORT}/${MTX_PATH}/${file}${qs}`, {
+    const r = await fetch(`${upstream}/${MTX_PATH}/${file}${qs}`, {
       headers: { Authorization: auth },
     });
     const buf = Buffer.from(await r.arrayBuffer());
@@ -187,6 +199,7 @@ function sendJoined(ws, room, member) {
     presenterId: room.presenterId,
     presenterMode: room.presenterMode || null,
     obsAvailable: OBS_ENABLED,
+    hlsDirect: HLS_DIRECT_URL,
   });
 }
 
