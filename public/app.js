@@ -675,28 +675,32 @@ function hlsAttempt() {
   };
 
   if (window.Hls && window.Hls.isSupported()) {
+    // 用标准 HLS（非低延迟模式）：更稳，不依赖阻塞式分片预取（那条路会卡住）。
+    // 延迟约 2~4 秒，换来任何网络都能稳定出画。
     const inst = new window.Hls({
-      lowLatencyMode: true,
-      liveSyncDurationCount: 2,
+      lowLatencyMode: false,
+      liveSyncDurationCount: 3,
       backBufferLength: 10,
-      manifestLoadingMaxRetry: 0,   // 拉不到就由我们自己按节奏重试（OBS 可能还没开播）
-      levelLoadingMaxRetry: 2,
-      fragLoadingMaxRetry: 3,
+      manifestLoadingMaxRetry: 4,
+      levelLoadingMaxRetry: 4,
+      fragLoadingMaxRetry: 6,
     });
     hls.inst = inst;
     inst.loadSource(hlsSrc());
     inst.attachMedia(video);
     inst.on(window.Hls.Events.FRAG_BUFFERED, onLive);
     inst.on(window.Hls.Events.ERROR, (_e, data) => {
-      if (!hls.active || inst !== hls.inst) return;
-      if (data.fatal || data.details === 'manifestLoadError' || data.details === 'levelEmptyError') {
-        // OBS 还没开播 / 暂时断流：清画面回到等待，稍后重试
-        hls.live = false;
-        try { inst.destroy(); } catch { /* ignore */ }
-        if (inst === hls.inst) hls.inst = null;
-        onHlsDown();
-        scheduleHlsRetry(2000);
+      if (!hls.active || inst !== hls.inst || !data.fatal) return;
+      // 流暂时不可用（OBS 还没开播/断流）→ 整段重来；媒体错误先尝试就地恢复
+      const gone = /manifestLoad|levelEmpty|levelLoad/.test(data.details || '');
+      if (data.type === window.Hls.ErrorTypes.MEDIA_ERROR && !gone) {
+        try { inst.recoverMediaError(); return; } catch { /* 落到下面重建 */ }
       }
+      hls.live = false;
+      try { inst.destroy(); } catch { /* ignore */ }
+      if (inst === hls.inst) hls.inst = null;
+      onHlsDown();
+      scheduleHlsRetry(2000);
     });
   } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
     // iOS/Safari 原生 HLS
