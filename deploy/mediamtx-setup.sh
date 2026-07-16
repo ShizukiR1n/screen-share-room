@@ -51,12 +51,10 @@ rtmpEncryption: "no"
 hls: yes
 hlsAddress: :8888
 hlsAllowOrigin: '*'
-# 低延迟 HLS（约 1~3 秒）；always remux 让推流一开始就有播放列表，观看端出画更快
-hlsVariant: lowLatency
-hlsAlwaysRemux: yes
+# mpegts（单轨 TS）：hls.js 播 lowLatency/fMP4 分轨会卡在 readyState 0，mpegts 秒播
+hlsVariant: mpegts
 hlsSegmentCount: 7
 hlsSegmentDuration: 1s
-hlsPartDuration: 200ms
 api: no
 metrics: no
 playback: no
