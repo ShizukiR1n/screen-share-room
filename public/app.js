@@ -658,23 +658,43 @@ function startHls() {
   hls.srcIdx = 0;
   hls.fails = 0;
   // 看门狗：出画后若画面 8 秒没前进（典型场景：OBS 中途重开导致时间线重置，
-  // hls.js 只报非致命错误不自救），整个推倒重连
+  // hls.js 只报非致命错误不自救），整个推倒重连；顺带做延迟追赶——
+  // hls.js 自带的追赶实测不生效，自己动手：落后目标 1.5 秒就 1.2 倍速悄悄追，
+  // 落后 8 秒以上直接跳回直播边缘（不追赶的话抖一次延迟就永远还不掉）
   hls.lastT = 0;
   hls.stuck = 0;
   clearInterval(hls.dog);
   hls.dog = setInterval(() => {
     if (!hls.active || !hls.live) { hls.stuck = 0; return; }
-    const t = el.stageVideo.currentTime;
-    if (t > hls.lastT + 0.2 || el.stageVideo.paused) { hls.lastT = t; hls.stuck = 0; return; }
-    hls.stuck += 4;
-    if (hls.stuck >= 8) {
+    const v = el.stageVideo;
+    const t = v.currentTime;
+    if (t > hls.lastT + 0.2 || v.paused) {
+      hls.lastT = t;
       hls.stuck = 0;
-      hls.live = false;
-      if (hls.inst) { try { hls.inst.destroy(); } catch { /* ignore */ } hls.inst = null; }
-      onHlsDown();
-      scheduleHlsRetry(500);
+    } else {
+      hls.stuck += 2;
+      if (hls.stuck >= 8) {
+        hls.stuck = 0;
+        hls.live = false;
+        if (hls.inst) { try { hls.inst.destroy(); } catch { /* ignore */ } hls.inst = null; }
+        onHlsDown();
+        scheduleHlsRetry(500);
+        return;
+      }
     }
-  }, 4000);
+    const inst = hls.inst;
+    if (inst && inst.media === v && typeof inst.latency === 'number' && inst.targetLatency != null) {
+      const over = inst.latency - inst.targetLatency;
+      if (over > 8 && isFinite(inst.liveSyncPosition)) {
+        v.currentTime = inst.liveSyncPosition;
+        v.playbackRate = 1;
+      } else if (over > 1.5) {
+        v.playbackRate = 1.2;
+      } else if (over < 0.5 && v.playbackRate !== 1) {
+        v.playbackRate = 1;
+      }
+    }
+  }, 2000);
   hlsAttempt();
 }
 
