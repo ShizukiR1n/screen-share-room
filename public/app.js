@@ -697,10 +697,13 @@ function hlsAttempt() {
 
   if (window.Hls && window.Hls.isSupported()) {
     // 用标准 HLS（非低延迟模式）：更稳，不依赖阻塞式分片预取（那条路会卡住）。
-    // 延迟约 2~4 秒，换来任何网络都能稳定出画。
+    // 关键是防延迟累积：离直播边缘超过目标就 1.5 倍速追赶，落后太多直接跳到边缘，
+    // 否则一次网络抖动攒下的延迟会永远还不掉（实测能攒到 20 秒）。
     const inst = new window.Hls({
       lowLatencyMode: false,
-      liveSyncDurationCount: 3,
+      liveSyncDurationCount: 2,       // 距边缘 2 个切片起播（切片 1~2 秒）
+      liveMaxLatencyDurationCount: 6, // 落后超 6 个切片：跳回同步点
+      maxLiveSyncPlaybackRate: 1.5,   // 落后时悄悄加速播放追上去
       backBufferLength: 10,
       manifestLoadingMaxRetry: 4,
       levelLoadingMaxRetry: 4,
