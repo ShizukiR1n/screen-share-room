@@ -631,7 +631,7 @@ function closeAllPeers() {
 // 都通过 HLS(HTTP/TCP) 从服务器拉流，经本站代理。全程 TCP，绕开运营商对 UDP 的限速。
 // 代价是有 1~3 秒延迟。OBS 未开播时 m3u8 会 404，静默重试直到出流。
 
-const hls = { inst: null, active: false, timer: null, live: false, srcIdx: 0, fails: 0 };
+const hls = { inst: null, active: false, timer: null, live: false, srcIdx: 0, fails: 0, dog: null, lastT: 0, stuck: 0 };
 
 // 播放地址按优先级排列：直连媒体服务器（国内链路，几十 Mbps）优先，
 // 经 Render 的 /hls 代理垫底（跨境只有 ~2Mbps，只能兜低码率的底）。
@@ -657,6 +657,24 @@ function startHls() {
   hls.live = false;
   hls.srcIdx = 0;
   hls.fails = 0;
+  // 看门狗：出画后若画面 8 秒没前进（典型场景：OBS 中途重开导致时间线重置，
+  // hls.js 只报非致命错误不自救），整个推倒重连
+  hls.lastT = 0;
+  hls.stuck = 0;
+  clearInterval(hls.dog);
+  hls.dog = setInterval(() => {
+    if (!hls.active || !hls.live) { hls.stuck = 0; return; }
+    const t = el.stageVideo.currentTime;
+    if (t > hls.lastT + 0.2 || el.stageVideo.paused) { hls.lastT = t; hls.stuck = 0; return; }
+    hls.stuck += 4;
+    if (hls.stuck >= 8) {
+      hls.stuck = 0;
+      hls.live = false;
+      if (hls.inst) { try { hls.inst.destroy(); } catch { /* ignore */ } hls.inst = null; }
+      onHlsDown();
+      scheduleHlsRetry(500);
+    }
+  }, 4000);
   hlsAttempt();
 }
 
@@ -665,6 +683,8 @@ function stopHls() {
   hls.live = false;
   clearTimeout(hls.timer);
   hls.timer = null;
+  clearInterval(hls.dog);
+  hls.dog = null;
   if (hls.inst) { try { hls.inst.destroy(); } catch { /* ignore */ } hls.inst = null; }
   if (el.stageVideo.src) { el.stageVideo.removeAttribute('src'); el.stageVideo.load(); }
   stopStats();
