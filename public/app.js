@@ -745,7 +745,7 @@ function hlsAttempt() {
       liveMaxLatencyDurationCount: 6, // 落后超 6 个切片：跳回同步点
       maxLiveSyncPlaybackRate: 1.5,   // 落后时悄悄加速播放追上去
       backBufferLength: 10,
-      manifestLoadingMaxRetry: 4,
+      manifestLoadingMaxRetry: 1, // 未开播 404 无需内部慢重试，外层 2 秒循环兜着
       levelLoadingMaxRetry: 4,
       fragLoadingMaxRetry: 6,
     });
@@ -761,7 +761,11 @@ function hlsAttempt() {
         try { inst.recoverMediaError(); return; } catch { /* 落到下面重建 */ }
       }
       hls.live = false;
-      hlsFail();
+      // 404 = OBS 还没开播，不是线路故障：别轮换线路，守着直连等开播。
+      // 否则等待期会轮到慢速中转档（~2Mbps），开播瞬间恰好在那档就会
+      // "出画几秒→断粮卡死"（真实线路故障如证书/防火墙拦截才轮换）
+      const code = data.response && data.response.code;
+      if (!(gone && code === 404)) hlsFail();
       try { inst.destroy(); } catch { /* ignore */ }
       if (inst === hls.inst) hls.inst = null;
       onHlsDown();
