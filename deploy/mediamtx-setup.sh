@@ -6,8 +6,10 @@
 #   OBS ──RTMP(TCP 1935)──▶ MediaMTX ──HLS(HTTPS/TCP 8888)──▶ 浏览器【直连，走国内链路】
 #                                        └──（兜底）网页服务器 /hls 代理（跨境仅 ~2Mbps）
 # 观看端直连是关键：经海外网页服务器中转实测只有 ~2Mbps，扛不住 6~8Mbps 高清码率；
-# 直连国内服务器实测 60Mbps+。页面是 HTTPS，直连必须也是 HTTPS（混合内容限制），
-# 所以用 sslip.io 免费域名（<IP连字符>.sslip.io 自动解析回本机）+ acme.sh 免费证书。
+# 直连国内服务器实测 60Mbps+。页面是 HTTPS，直连必须也是 HTTPS（混合内容限制）。
+# ⚠️ 国内服务器有备案墙：任何"域名"访问（含 sslip.io 等免费域名、任意端口）都会被
+# 云厂商拦截到备案提示页——所以必须用 Let's Encrypt 的【纯 IP 证书】（shortlived
+# profile，约 6.5 天有效，用 lego 客户端签发 + cron 自动续期；纯 IP 访问不受备案墙管）。
 # HLS 读权限对「长随机路径」匿名开放（路径即口令，Safari 原生播放器带不了鉴权头）。
 #
 # 需在云控制台防火墙放行：
@@ -21,10 +23,17 @@ if [ -z "$PUBIP" ]; then
 fi
 
 MTX_VERSION=v1.12.3
+# lego（ACME 客户端，签 IP 证书用）；升级版本时要同步更新官方 sha256
+LEGO_VERSION=v5.2.2
+LEGO_SHA256=018de6d3f2da09630caa2fbbe8c6aa459323ad0ac0a053d0e808268914b38a8b
+ACME_EMAIL="${2:-}"
 PUBPASS=$(openssl rand -hex 16)
 READPASS=$(openssl rand -hex 16)
 STREAMPATH="beam-$(openssl rand -hex 12)"
-SSLIP_HOST="$(echo "$PUBIP" | tr . -).sslip.io"
+if [ -z "$ACME_EMAIL" ]; then
+  echo "用法: bash mediamtx-setup.sh <服务器公网IP> <证书联系邮箱>"
+  exit 1
+fi
 
 # ---------- 下载 MediaMTX（GitHub 直连在国内经常超时，按镜像顺序回退） ----------
 cd /tmp
@@ -47,30 +56,45 @@ fi
 mkdir -p /opt/mediamtx
 tar xzf mediamtx.tar.gz -C /opt/mediamtx mediamtx
 
-# ---------- HTTPS 证书（sslip.io 域名 + acme.sh，自动续期） ----------
-export DEBIAN_FRONTEND=noninteractive
-apt-get install -y -qq socat >/dev/null 2>&1 || true
-
-if [ ! -d /root/.acme.sh ]; then
-  curl -fsSL https://get.acme.sh | sh -s email=beam-$(openssl rand -hex 4)@example.com \
-    || git clone --depth 1 https://gitee.com/neilpang/acme.sh /tmp/acme.sh \
-       && (cd /tmp/acme.sh && ./acme.sh --install --accountemail beam@example.com) || true
+# ---------- HTTPS 证书（Let's Encrypt 纯 IP 短效证书 + lego，自动续期） ----------
+if [ ! -x /usr/local/bin/lego ]; then
+  cd /tmp && rm -f lego.tgz
+  ok=""
+  for base in \
+    "https://gh-proxy.com/https://github.com/go-acme/lego/releases/download" \
+    "https://ghproxy.net/https://github.com/go-acme/lego/releases/download" \
+    "https://github.com/go-acme/lego/releases/download"; do
+    if curl -fsSL --connect-timeout 10 -o lego.tgz \
+      "$base/${LEGO_VERSION}/lego_${LEGO_VERSION}_linux_amd64.tar.gz"; then
+      ok=1; break
+    fi
+  done
+  [ -n "$ok" ] || { echo "❌ 下载 lego 失败"; exit 1; }
+  # 镜像下载必须校验官方 sha256，防篡改
+  echo "${LEGO_SHA256}  lego.tgz" | sha256sum -c - || { echo "❌ lego 校验失败"; exit 1; }
+  tar xzf lego.tgz lego && mv lego /usr/local/bin/lego
 fi
-ACME=/root/.acme.sh/acme.sh
-if [ ! -x "$ACME" ]; then
-  echo "❌ acme.sh 安装失败，请把此信息发给 Claude"
-  exit 1
-fi
 
-# standalone 模式临时占用 80 端口验证域名归属（需防火墙放行 TCP 80）
+# HTTP-01 验证临时占用 80 端口（需防火墙放行 TCP 80）；纯 IP 访问不受备案墙拦截
 if [ ! -f /opt/mediamtx/tls.crt ]; then
-  "$ACME" --issue --standalone -d "$SSLIP_HOST" --server letsencrypt \
-    || "$ACME" --issue --standalone -d "$SSLIP_HOST" --server zerossl
-  "$ACME" --install-cert -d "$SSLIP_HOST" \
-    --key-file /opt/mediamtx/tls.key \
-    --fullchain-file /opt/mediamtx/tls.crt \
-    --reloadcmd "systemctl restart mediamtx"
+  /usr/local/bin/lego run --accept-tos -m "$ACME_EMAIL" -d "$PUBIP" \
+    --http --profile shortlived --path /opt/lego
+  cp "/opt/lego/certificates/${PUBIP}.crt" /opt/mediamtx/tls.crt
+  cp "/opt/lego/certificates/${PUBIP}.key" /opt/mediamtx/tls.key
 fi
+
+# 短效证书 ~6.5 天有效：每天检查，满 3 天就重签
+cat > /opt/lego/renew.sh <<RENEW
+#!/bin/bash
+if [ -z "\$(find /opt/mediamtx/tls.crt -mtime +2 2>/dev/null)" ]; then exit 0; fi
+/usr/local/bin/lego run --accept-tos -m ${ACME_EMAIL} -d ${PUBIP} --http --profile shortlived --path /opt/lego \\
+  && cp /opt/lego/certificates/${PUBIP}.crt /opt/mediamtx/tls.crt \\
+  && cp /opt/lego/certificates/${PUBIP}.key /opt/mediamtx/tls.key \\
+  && systemctl restart mediamtx
+RENEW
+chmod +x /opt/lego/renew.sh
+echo '30 4 * * * root /opt/lego/renew.sh >>/var/log/lego-renew.log 2>&1' > /etc/cron.d/lego-renew
+chmod 644 /etc/cron.d/lego-renew
 
 # ---------- MediaMTX 配置 ----------
 cat > /opt/mediamtx/mediamtx.yml <<EOF
@@ -151,7 +175,7 @@ if systemctl is-active --quiet mediamtx; then
   echo "MTX_PUBLISH_PASS=${PUBPASS}"
   echo "MTX_READ_PASS=${READPASS}"
   echo "MTX_PATH=${STREAMPATH}"
-  echo "MTX_HLS_PUBLIC=https://${SSLIP_HOST}:8888"
+  echo "MTX_HLS_PUBLIC=https://${PUBIP}:8888"
   echo "=================================================="
 else
   echo "❌ MediaMTX 启动失败，请把以下日志发给 Claude："
